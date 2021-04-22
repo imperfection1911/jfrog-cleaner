@@ -1,0 +1,197 @@
+resource_types:
+
+  - name: git-multibranch
+    type: docker-image
+    source:
+      username: ((docker_user))
+      password: ((docker_password))
+      repository: /devops/git-multibranch-resource
+
+  - name: concourse-bitbucket-pullrequest
+    type: docker-image
+    source:
+      repository: ((docker_proxy))/mm62/concourse-bitbucket-pullrequest-resource
+
+  - name: bitbucket-build-status
+    type: docker-image
+    source:
+      repository: ((docker_proxy))/shyxormz/bitbucket-build-status-resource
+
+resources:
+
+  - name: pullrequest
+    type: concourse-bitbucket-pullrequest
+    source:
+      username: ((bitbucket_username))
+      password: ((bitbucket_password))
+      uri: https://((bitbucket_host))/scm/((project_prefix))/((project_name)).git
+
+  - name: build-status
+    type: bitbucket-build-status
+    source:
+      username: ((bitbucket_username))
+      password: ((bitbucket_password))
+      endpoint: https://((bitbucket_host))
+
+  - name: git-resource-image
+    type: docker-image
+    source:
+      repository: ((docker_repo))/((docker_prefix))/((project_name))
+      username: ((docker_user))
+      password: ((docker_password))
+
+  - name: source-code-master
+    type: git-multibranch
+    check_every: 1m
+    source:
+      uri: ssh://git@((bitbucket_host)):7999/((project_prefix))/((project_name)).git
+      private_key: ((git_private_key))
+      branches: master
+      ignore_paths:
+        - .ci/
+        - .helm/
+
+  - name: source-code-ci
+    type: git
+    source:
+      username: ((bitbucket_username))
+      password: ((bitbucket_password))
+      branch: master
+      uri: https://((bitbucket_host))/scm/((project_prefix))/((project_name)).git
+      paths:
+        - .ci/
+
+  - name: source-code-helm
+    type: git
+    source:
+      username: ((bitbucket_username))
+      password: ((bitbucket_password))
+      branch: master
+      uri: https://((bitbucket_host))/scm/((project_prefix))/((project_name)).git
+      paths:
+        - .helm/
+
+jobs:
+
+  - name: "PR build"
+    serial: true
+    plan:
+      - get: pullrequest
+        trigger: true
+
+      - put: pullrequest
+        params:
+          path: pullrequest
+          status: pending
+
+      - task: lint Dockerfile
+        config:
+          platform: linux
+
+          image_resource:
+            type: docker-image
+            source:
+              repository: projectatomic/dockerfile-lint
+              tag: latest
+
+          inputs:
+            - name: pullrequest
+          outputs:
+            - name: lint
+
+          run:
+            dir: pullrequest
+            path: sh
+            args:
+              - -ec
+              - |
+                dockerfile_lint -f Dockerfile && echo "pr" > ../lint/tag
+
+      - put: git-resource-image
+        params:
+          build: pullrequest
+          tag_file: lint/tag
+          build_args:
+            project_name: ((project_name))
+
+        on_success:
+          do:
+            - put: pullrequest
+              params:
+                path: pullrequest
+                status: success
+
+
+        on_failure:
+          do:
+            - put: pullrequest
+              params:
+                path: pullrequest
+                status: failure
+
+  - name: "Master build"
+    plan:
+      - get: source-code-master
+        trigger: true
+
+      - put: git-resource-image
+        params:
+          build: source-code-master
+          tag_file: source-code-master/tag
+          tag_as_latest: true
+          build_args:
+            project_name: ((project_name))
+
+        on_success:
+          do:
+            - put: build-status
+              params:
+                build_status: SUCCESSFUL
+                repository: source-code-master
+
+        on_failure:
+          do:
+            - put: build-status
+              params:
+                build_status: FAILED
+                repository: source-code-master
+
+
+
+  - name: "Push Helm Chart to Artifactory"
+    plan:
+      - get: source-code-helm
+        trigger: true
+
+      - task: push
+        config:
+          platform: linux
+
+          image_resource:
+            type: docker-image
+            source:
+              repository:  /devops/k8s-toolkit
+              tag: latest
+              username: ((docker_user))
+              password: ((docker_password))
+
+          inputs:
+            - name: source-code-helm
+
+          run:
+            dir: source-code-helm
+            path: sh
+            args:
+              - -ec
+              - |
+                helm push-artifactory .helm/ dclab_push
+
+  - name: "Apply new pipeline"
+    plan:
+      - get: source-code-ci
+        trigger: true
+
+      - set_pipeline: self
+        file: source-code-ci/.ci/pipeline.yaml
+        var_files:
+          - source-code-ci/.ci/vars.yaml
